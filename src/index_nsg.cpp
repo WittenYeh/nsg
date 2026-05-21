@@ -91,7 +91,11 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
 
   retset.resize(L + 1);
   std::vector<unsigned> init_ids(L);
-  // initializer_->Search(query, nullptr, L, parameter, init_ids.data());
+  // WittenYeh fork: per-call fresh mt19937 seeded with 0x1234 mirrors FAISS's
+  // `RandomGenerator gen(0x1234)` inside search_on_graph. Thread-safe (local)
+  // and yields the same padding ids on every call, so the candidate pool no
+  // longer depends on global rand()-state interleaving.
+  std::mt19937 gen(0x1234);
 
   boost::dynamic_bitset<> flags{nd_, 0};
   L = 0;
@@ -101,7 +105,7 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
     L++;
   }
   while (L < init_ids.size()) {
-    unsigned id = rand() % nd_;
+    unsigned id = gen() % nd_;
     if (flags[id]) continue;
     init_ids[L] = id;
     L++;
@@ -160,7 +164,9 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
 
   retset.resize(L + 1);
   std::vector<unsigned> init_ids(L);
-  // initializer_->Search(query, nullptr, L, parameter, init_ids.data());
+  // WittenYeh fork: see the sibling overload above; same per-call mt19937
+  // seeded with 0x1234 to match FAISS's search_on_graph RNG.
+  std::mt19937 gen(0x1234);
 
   L = 0;
   for (unsigned i = 0; i < init_ids.size() && i < final_graph_[ep_].size(); i++) {
@@ -169,7 +175,7 @@ void IndexNSG::get_neighbors(const float *query, const Parameters &parameter,
     L++;
   }
   while (L < init_ids.size()) {
-    unsigned id = rand() % nd_;
+    unsigned id = gen() % nd_;
     if (flags[id]) continue;
     init_ids[L] = id;
     L++;
@@ -233,7 +239,10 @@ void IndexNSG::init_graph(const Parameters &parameters) {
     center[j] /= nd_;
   }
   std::vector<Neighbor> tmp, pool;
-  ep_ = rand() % nd_;  // random initialize navigating point
+  // WittenYeh fork: use class-level mt19937 (seed 0x0903) to mirror FAISS's
+  // `rng.rand_int(n)` in init_graph — eliminates the rand()-seed wobble that
+  // landed efanna and FAISS on different ep_ values on the same dataset.
+  ep_ = mt_rng_() % nd_;
   get_neighbors(center, parameters, tmp, pool);
   ep_ = tmp[0].id;
   delete center;
@@ -281,13 +290,19 @@ void IndexNSG::sync_prune(unsigned q, std::vector<Neighbor> &pool,
     if (!occlude) result.push_back(p);
   }
 
+  // WittenYeh fork: bulk-fill every trailing slot with the -1 sentinel
+  // instead of a single sentinel at slot `result.size()`. cut_graph_ comes
+  // from `new SimpleNeighbor[nd_*range]` (uninitialised heap), so trailing
+  // slots otherwise hold garbage that InterInsert's overflow path can
+  // re-expose as live edges. Mirrors FAISS NSG.cpp:447-454.
   SimpleNeighbor *des_pool = cut_graph_ + (size_t)q * (size_t)range;
-  for (size_t t = 0; t < result.size(); t++) {
-    des_pool[t].id = result[t].id;
-    des_pool[t].distance = result[t].distance;
-  }
-  if (result.size() < range) {
-    des_pool[result.size()].distance = -1;
+  for (size_t t = 0; t < (size_t)range; t++) {
+    if (t < result.size()) {
+      des_pool[t].id = result[t].id;
+      des_pool[t].distance = result[t].distance;
+    } else {
+      des_pool[t].distance = -1;
+    }
   }
 }
 
@@ -341,10 +356,21 @@ void IndexNSG::InterInsert(unsigned n, unsigned range,
         }
         if (!occlude) result.push_back(p);
       }
+      // WittenYeh fork: after MRNG-reprune of the overflow pool we keep
+      // only `result.size()` survivors. Without an explicit terminator the
+      // slots in [result.size(), range) retain the previous saturated
+      // neighborhood, which subsequent InterInsert calls then read as live
+      // edges (the cut_graph_ scan stops at the first distance == -1, so
+      // a missing sentinel admits the entire trailing region). Bulk-fill
+      // -1 into the trailing slots so the sentinel chain is preserved.
       {
         LockGuard guard(locks[des]);
-        for (unsigned t = 0; t < result.size(); t++) {
-          des_pool[t] = result[t];
+        for (unsigned t = 0; t < range; t++) {
+          if (t < result.size()) {
+            des_pool[t] = result[t];
+          } else {
+            des_pool[t].distance = -1;
+          }
         }
       }
     } else {
@@ -647,6 +673,14 @@ void IndexNSG::DFS(boost::dynamic_bitset<> &flag, unsigned root, unsigned &cnt) 
 
 void IndexNSG::findroot(boost::dynamic_bitset<> &flag, unsigned &root,
                         const Parameters &parameter) {
+  // FAISS-aligned modification (WittenYeh fork):
+  // Original upstream attached the orphan onto the nearest reachable node
+  // via raw push_back, which lets hub nodes exceed the R out-degree cap
+  // and admits edges that bypass the MRNG occlusion check. faiss's
+  // `attach_unlinked` instead requires the chosen root to still have
+  // degree < R. We mirror that here so the global degree cap holds.
+  const unsigned R = parameter.Get<unsigned>("R");
+
   unsigned id = nd_;
   for (unsigned i = 0; i < nd_; i++) {
     if (flag[i] == false) {
@@ -663,8 +697,7 @@ void IndexNSG::findroot(boost::dynamic_bitset<> &flag, unsigned &root,
 
   unsigned found = 0;
   for (unsigned i = 0; i < pool.size(); i++) {
-    if (flag[pool[i].id]) {
-      // std::cout << pool[i].id << '\n';
+    if (flag[pool[i].id] && final_graph_[pool[i].id].size() < R) {
       root = pool[i].id;
       found = 1;
       break;
@@ -672,8 +705,10 @@ void IndexNSG::findroot(boost::dynamic_bitset<> &flag, unsigned &root,
   }
   if (found == 0) {
     while (true) {
-      unsigned rid = rand() % nd_;
-      if (flag[rid]) {
+      // WittenYeh fork: use class-level mt_rng_ (seed 0x0903) to mirror
+      // FAISS's `rng.rand_int(ntotal)` in attach_unlinked.
+      unsigned rid = mt_rng_() % nd_;
+      if (flag[rid] && final_graph_[rid].size() < R) {
         root = rid;
         break;
       }

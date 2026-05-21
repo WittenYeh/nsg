@@ -6,6 +6,7 @@
 #include "neighbor.h"
 #include "index.h"
 #include <cassert>
+#include <random>
 #include <unordered_map>
 #include <string>
 #include <sstream>
@@ -39,6 +40,25 @@ class IndexNSG : public Index {
       const Parameters &parameters,
       unsigned *indices);
   void OptimizeGraph(float* data);
+
+  // WittenYeh fork: read-only accessors used by the nsg-comparison profiler
+  // to dump post-build graph stats (degree dist, edge sets, ep_).
+  unsigned probe_ep() const { return ep_; }
+  const std::vector<std::vector<unsigned>>& probe_final_graph() const {
+    return final_graph_;
+  }
+
+  // WittenYeh fork: write-side hooks used by the cross-search experiment to
+  // inject an externally-built NSG (e.g., one produced by faiss::IndexNSG)
+  // and then drive efanna's SearchWithOptGraph against it. Caller must:
+  //   1. construct IndexNSG with the correct (dimension, n, metric, nullptr)
+  //   2. set_data(xb), set_final_graph(...), set_ep(...)
+  //   3. OptimizeGraph(xb)  -> SearchWithOptGraph(...)
+  void inject_data(const float* data) { data_ = data; has_built = true; }
+  void inject_ep(unsigned ep) { ep_ = ep; }
+  void inject_final_graph(std::vector<std::vector<unsigned>>&& g) {
+    final_graph_ = std::move(g);
+  }
 
   protected:
     typedef std::vector<std::vector<unsigned > > CompactGraph;
@@ -79,6 +99,11 @@ class IndexNSG : public Index {
     size_t data_len;
     size_t neighbor_len;
     KNNGraph nnd_graph;
+    // WittenYeh fork: class-level RNG with the same seed FAISS uses for its
+    // NSG::rng member (0x0903). Drives ep_ pick + findroot random fallback.
+    // mt19937 is byte-identical to faiss::RandomGenerator (both wrap mt19937
+    // and use `mt() % n` for rand_int(n)).
+    std::mt19937 mt_rng_{0x0903};
 };
 }
 
